@@ -1,0 +1,262 @@
+# Copyright 1999-2026 Gentoo Authors
+# Distributed under the terms of the GNU General Public License v2
+
+EAPI=8
+
+PYTHON_COMPAT=( python3_{12..15} )
+inherit cmake llvm.org python-any-r1 toolchain-funcs
+
+DESCRIPTION="LLVM's implementation of the C standard library"
+HOMEPAGE="https://libc.llvm.org/"
+# getent and iconv are the ones Alpine wrote for musl, the same files
+# sys-libs/musl installs. The library has iconv itself; this is the utility
+# which goes with it. getconf is written for this library, which does not have
+# every name musl's getconf asks for. llvm.org_set_globals adds the LLVM
+# sources further down.
+MUSL_UTIL_COMMIT="93a08815f8598db442d8b766b463d0150ed8e2ab"
+GETENT_FILE="musl-getent-${MUSL_UTIL_COMMIT}.c"
+ICONV_FILE="musl-iconv-${MUSL_UTIL_COMMIT}.c"
+SRC_URI="
+	https://gitlab.alpinelinux.org/alpine/aports/-/raw/${MUSL_UTIL_COMMIT}/main/musl/getent.c
+		-> ${GETENT_FILE}
+	https://gitlab.alpinelinux.org/alpine/aports/-/raw/${MUSL_UTIL_COMMIT}/main/musl/iconv.c
+		-> ${ICONV_FILE}
+"
+
+# getent is BSD-2, iconv is GPL-2+.
+LICENSE="Apache-2.0-with-LLVM-exceptions || ( UoI-NCSA MIT ) BSD-2 GPL-2+"
+SLOT="${LLVM_MAJOR}"
+KEYWORDS="~amd64"
+IUSE="test"
+RESTRICT="!test? ( test )"
+
+# A runtimes build takes its cmake modules from the tree it is building, so
+# there is nothing here for an installed LLVM of the same slot to provide.
+# Any clang recent enough to build the tree will do, and need not match: the
+# 24 series builds with 23. (Locally relaxed to 22 for a test host.)
+BDEPEND="
+	|| (
+		llvm-core/clang:${LLVM_MAJOR}
+		>=llvm-core/clang-22:*
+	)
+	$(python_gen_any_dep 'dev-python/pyyaml[${PYTHON_USEDEP}]')
+"
+DEPEND="virtual/os-headers"
+# ldd below is a wrapper around lddtree. fts.h and fts_open come from libc, so
+# the standalone copy would collide with them.
+RDEPEND="
+	app-misc/pax-utils
+	!sys-libs/fts-standalone
+"
+
+# The libc is built through the runtimes directory rather than on its own, so
+# that scudo can be taken from compiler-rt in the same configure.
+LLVM_COMPONENTS=( libc runtimes cmake llvm/cmake compiler-rt third-party/siphash )
+# Enabling tests makes the runtimes build add llvm-lit, even though check-libc
+# itself does not use it.
+LLVM_TEST_COMPONENTS=( llvm/utils )
+llvm.org_set_globals
+
+# Local checkout of the FireBurn fork, merged onto current llvm main.
+EGIT_REPO_URI="https://github.com/tinted-software/llvm-project"
+EGIT_BRANCH="libc-shared-lib-support-merge"
+
+pkg_pretend() {
+	# This is the C library of the system it goes on: it owns the headers in
+	# /usr/include and installs a loader and libc.so of its own. On a system
+	# already running glibc or musl it would take their place, so it refuses.
+	[[ ${MERGE_TYPE} == buildonly ]] && return
+	local lib
+	for lib in "${EROOT}"/{,usr/}lib{,64}/{libc.so.6,ld-musl-*.so.1}; do
+		[[ -e ${lib} ]] || continue
+		# sys-libs/musl-abi puts this library's own loader under the name a
+		# musl binary asks for. That is this library, not another one.
+		[[ $(readlink "${lib}") == ld-llvm-libc-*.so.1 ]] && continue
+		# sys-libs/glibc-abi is libc.so.6 on top of this library, for the
+		# programs built for glibc.
+		[[ ${lib##*/} == libc.so.6 ]] && has_version sys-libs/glibc-abi && continue
+		die "${lib#"${EROOT}"} belongs to another C library, which ${PN} would replace"
+	done
+}
+
+python_check_deps() {
+	python_has_version "dev-python/pyyaml[${PYTHON_USEDEP}]"
+}
+
+pkg_setup() {
+	# The library is written for clang: it uses builtins and attributes GCC
+	# does not have, and the headers it generates are meant for clang.
+	tc-is-clang || die "llvm-libc must be built with clang, set CC=clang"
+	python-any-r1_pkg_setup
+}
+
+src_configure() {
+	CMAKE_USE_DIR=${WORKDIR}/runtimes
+
+	local libdir=$(get_libdir)
+	local mycmakeargs=(
+		-DLLVM_ENABLE_RUNTIMES="libc;compiler-rt"
+
+		# A full build owns the headers as well as the library, which is the
+		# only way it can be the C library of the system rather than a set of
+		# functions layered over another one.
+		-DLLVM_LIBC_FULL_BUILD=ON
+		-DLIBC_ENABLE_SHARED=ON
+		# scudo is the allocator. Without it malloc and the rest are only
+		# declared, and nothing implements them.
+		-DLLVM_LIBC_INCLUDE_SCUDO=ON
+		# scudo is compiled against the headers of the libc it goes into, not
+		# those of whatever C library the build machine has.
+		-DRUNTIMES_USE_LIBC=llvm-libc
+
+		# The libraries, startup files and loader go in the platform's libdir
+		# like any other C library, and not in a directory per target.
+		-DLLVM_LIBDIR_SUFFIX=${libdir#lib}
+		-DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=OFF
+
+		# The entrypoints behind this are the ones which are implemented but
+		# not yet in the default list, which is most of what a distribution
+		# needs from it today.
+		-DLLVM_LIBC_ENABLE_EXPERIMENTAL_ENTRYPOINTS=ON
+
+		# Wide character classification and case mapping follow Unicode, as
+		# they do in glibc's UTF-8 locales. The default knows only ASCII, so a
+		# program matching or folding the case of anything else is wrong.
+		-DLIBC_CONF_WCTYPE_MODE=LIBC_WCTYPE_MODE_UTF8
+
+		-DLLVM_INCLUDE_TESTS=$(usex test)
+
+		# Of compiler-rt, only scudo is wanted.
+		-DCOMPILER_RT_SANITIZERS_TO_BUILD=scudo_standalone
+		-DCOMPILER_RT_BUILD_GWP_ASAN=OFF
+		-DCOMPILER_RT_BUILD_BUILTINS=OFF
+		-DCOMPILER_RT_BUILD_XRAY=OFF
+		-DCOMPILER_RT_BUILD_LIBFUZZER=OFF
+		-DCOMPILER_RT_BUILD_PROFILE=OFF
+		-DCOMPILER_RT_BUILD_CTX_PROFILE=OFF
+		-DCOMPILER_RT_BUILD_MEMPROF=OFF
+		-DCOMPILER_RT_BUILD_ORC=OFF
+	)
+
+	# The standalone cross recipe from libc/docs/full_cross_build.md: the
+	# compiler is told the target explicitly, and headergen/full-build use
+	# LIBC_TARGET_TRIPLE. Kernel headers come from the sysroot, not the
+	# build host. TRY_COMPILE as a static library: there is no target libc
+	# to link a configure test executable against yet.
+	if [[ ${CBUILD:-${CHOST}} != ${CHOST} ]]; then
+		mycmakeargs+=(
+			-DCMAKE_C_COMPILER_TARGET=${CHOST}
+			-DCMAKE_CXX_COMPILER_TARGET=${CHOST}
+			-DLIBC_TARGET_TRIPLE=${CHOST}
+			-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
+			-DLLVM_ENABLE_LLD=ON
+		)
+		[[ -d ${ESYSROOT}/usr/include ]] &&
+			mycmakeargs+=(-DLIBC_KERNEL_HEADERS=${ESYSROOT}/usr/include)
+	fi
+
+	cmake_src_configure
+}
+
+src_compile() {
+	# The library, its loader, startup files and headers, and nothing else.
+	# Configuring scudo also puts compiler-rt's sanitizer_common into the
+	# default target, and that does not build against this library's headers.
+	# The empty libdl, libpthread and the rest are made along with libc.
+	cmake_build libc libc-shared libm libm-shared libmvec libmvec-shared \
+		libc-startup libc-loader generate-libc-headers
+
+	# These are built against the library just built rather than the one
+	# installed, which may be too old to have everything they call or have a
+	# different ABI. The startup files have to come from it as well.
+	local stage=${T}/stage
+	DESTDIR="${stage}" cmake --install "${BUILD_DIR}" --component libc ||
+		die "staging libc failed"
+	local libc_build=${BUILD_DIR}/libc
+	local util
+	for util in getent iconv getconf; do
+		local src=${DISTDIR}/${GETENT_FILE}
+		[[ ${util} == iconv ]] && src=${DISTDIR}/${ICONV_FILE}
+		[[ ${util} == getconf ]] && src=${FILESDIR}/getconf.c
+		"$(tc-getCC)" ${CPPFLAGS} -isystem "${libc_build}/include" ${CFLAGS} \
+			${LDFLAGS} -B"${stage}${EPREFIX}/usr/$(get_libdir)" \
+			-L"${stage}${EPREFIX}/usr/$(get_libdir)" -o "${T}/${util}" \
+			"${src}" || die "building ${util} failed"
+	done
+}
+
+src_test() {
+	cmake_build check-libc
+}
+
+src_install() {
+	# Only the library and its headers. compiler-rt is configured alongside it
+	# for scudo, which ends up inside libc.so, and a plain install would put
+	# compiler-rt's own files into clang's resource directory as well.
+	local component
+	for component in libc libc-headers; do
+		DESTDIR="${D}" cmake --install "${BUILD_DIR}" --component "${component}" ||
+			die "installing ${component} failed"
+	done
+
+	# The loader looks under the directories /etc/ld-llvm-libc-<arch>.path
+	# lists, and env-update keeps ld.so.conf current from env.d, so the one
+	# file is a link to the other.
+	local arch=${CHOST%%-*}
+	[[ ${arch} == riscv* ]] && arch=riscv
+	dosym ld.so.conf "/etc/ld-llvm-libc-${arch}.path"
+
+	dobin "${T}"/getent "${T}"/iconv "${T}"/getconf
+
+	# The loader has no trace mode for glibc's ldd to drive, so this reads the
+	# dependencies out of the ELF files instead of by loading them.
+	cat > "${T}"/ldd <<-'EOF'
+		#!/bin/sh
+
+		files=
+		for arg; do
+		  case ${arg} in
+		  --version) echo "ldd (llvm-libc)"; exit 0 ;;
+		  --help) echo "usage: ldd FILE..."; exit 0 ;;
+		  -*) ;;
+		  *) files="${files} ${arg}" ;;
+		  esac
+		done
+
+		set -- ${files}
+		if [ $# -eq 0 ]; then
+		  echo "ldd: missing file arguments" >&2
+		  exit 1
+		fi
+
+		status=0
+		count=$#
+		for f; do
+		  [ ${count} -gt 1 ] && echo "${f}:"
+		  if [ ! -e "${f}" ]; then
+		    echo "ldd: ${f}: No such file or directory" >&2
+		    status=1
+		    continue
+		  fi
+		  # lddtree prints the file itself first and the rest as an indented
+		  # tree, in which a library reached more than one way repeats.
+		  deps=$(lddtree "${f}" 2>/dev/null | tail -n +2 | sed 's/^ *//' | sort -u)
+		  if [ -z "${deps}" ]; then
+		    printf '\tnot a dynamic executable\n'
+		    status=1
+		    continue
+		  fi
+		  echo "${deps}" | while IFS= read -r line; do
+		    soname=${line%% =>*}
+		    path=${line#*=> }
+		    if [ "${path}" = "not found" ]; then
+		      printf '\t%s => not found\n' "${soname}"
+		    else
+		      printf '\t%s => %s (0x0000000000000000)\n' "${soname}" "${path}"
+		    fi
+		  done
+		done
+		exit ${status}
+	EOF
+	dobin "${T}"/ldd
+}

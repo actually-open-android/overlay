@@ -1,0 +1,17 @@
+DEFINED_PHASES=compile configure install prepare pretend setup test unpack
+DEPEND=virtual/os-headers
+DESCRIPTION=LLVM's implementation of the C standard library
+EAPI=8
+HOMEPAGE=https://libc.llvm.org/
+IUSE=test test
+KEYWORDS=~amd64
+LICENSE=Apache-2.0-with-LLVM-exceptions || ( UoI-NCSA MIT ) BSD-2 GPL-2+
+RDEPEND=app-misc/pax-utils !sys-libs/fts-standalone
+RESTRICT=!test? ( test ) !test? ( test )
+SLOT=24
+SRC_URI=https://gitlab.alpinelinux.org/alpine/aports/-/raw/93a08815f8598db442d8b766b463d0150ed8e2ab/main/musl/getent.c -> musl-getent-93a08815f8598db442d8b766b463d0150ed8e2ab.c https://gitlab.alpinelinux.org/alpine/aports/-/raw/93a08815f8598db442d8b766b463d0150ed8e2ab/main/musl/iconv.c -> musl-iconv-93a08815f8598db442d8b766b463d0150ed8e2ab.c
+BDEPEND=|| ( llvm-core/clang:24 >=llvm-core/clang-22:* ) || ( ( dev-lang/python:3.15 dev-python/pyyaml[python_targets_python3_15(-)] ) ( dev-lang/python:3.14 dev-python/pyyaml[python_targets_python3_14(-)] ) ( dev-lang/python:3.13 dev-python/pyyaml[python_targets_python3_13(-)] ) ( dev-lang/python:3.12 dev-python/pyyaml[python_targets_python3_12(-)] ) ) app-alternatives/ninja >=dev-build/cmake-3.28.5 >=dev-vcs/git-1.8.2.1[curl]
+PROPERTIES=live
+INHERIT=cmake llvm.org python-any-r1 toolchain-funcs
+_eclasses_=toolchain-funcs	58a918e3a42d0156f010dcfd43725be5	flag-o-matic	fd3558f73f6503093adee69adf41020d	multiprocessing	45d0620f25c2f063ad6276ecd9ed9399	ninja-utils	d063ea1900a793f93eb095010d6d9156	xdg-utils	42869b3c8d86a70ef3cf75165a395e09	cmake	3530055400d05e64deaba3042af30af6	git-r3	e6c2f983e006e805160436c75a0c1562	llvm.org	8422aa70ce4e97c84860d579abde3627	eapi9-pipestatus	d2c134036ac31c3085aebc9147f572bd	python-utils-r1	025367880f07ae6444e6035a49db0dab	python-any-r1	891415dfe39ad9b41b461f2b86354af0
+_md5_=29731d7004dbd46af0a727a12f61e2af
